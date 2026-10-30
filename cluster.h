@@ -17,6 +17,8 @@ enum class Ship { Unicast, SBroadcast, SelBcastR, SfrR, SfrS };   // which count
 enum class Relation { R = 0, S = 1 };
 
 struct KeyCount { uint64_t key = 0; uint64_t count = 0; };
+
+//n_s is #tuples scanned
 struct Report { bool present = false; uint64_t n_s = 0; std::vector<KeyCount> keys; };
 struct Install { bool present = false; std::vector<KeyCount> list; };
  
@@ -45,7 +47,6 @@ struct Cluster {
 
 struct Detector {
     SpaceSaving hist;            // approximate key counts
-    uint64_t n_s = 0;            // fragment size
     uint64_t d = 0;              // report at this tuple
     double threshold = 0.0;      // heavy-key cutoff
     uint64_t seen = 0;           // tuples observed
@@ -140,7 +141,7 @@ inline size_t slot_of(Relation rel, int n, int server) {
     return static_cast<size_t>(rel) * static_cast<size_t>(n) + static_cast<size_t>(server);
 }
 
-// Write own report
+// Write own report , (here n_s means scanned tuples not fragment size)
 inline void post_report(Server& s, Relation rel, uint64_t n_s,
                         const std::vector<KeyCount>& keys) {
     ControlBoard& b = s.cluster->board;
