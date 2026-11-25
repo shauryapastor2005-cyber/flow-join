@@ -12,8 +12,8 @@
 #include <thread>
 #include <vector>
 
-const std::vector<std::string> ALL_WORKLOADS = {"w1", "w2", "w3"};
-const std::vector<std::string> ALL_ALGOS     = {"ref", "conv", "flow"};
+const std::vector<std::string> ALL_WORKLOADS = {"w1", "w2", "w3", "w4", "w5"};   // w4/w5: clustered placement
+const std::vector<std::string> ALL_ALGOS     = {"ref", "conv", "flow", "qpsr"};  // qpsr: Flow-Join + QPSR
 
 struct Options {
     std::vector<std::string> workloads;
@@ -23,6 +23,8 @@ struct Options {
     double scale = 1.0;
     bool scale_set = false;
     bool reduced = false;
+    double rho = 1.0;            // w4/w5: clustered fraction of heavy tuples
+    bool oversubscribe = false;  // allow n > cores (work/shipping metrics only; timings invalid)
 };
 
 struct RunRecord {
@@ -44,8 +46,8 @@ struct RunStats {
 
 static void print_usage_and_exit() {
     std::fprintf(stderr,
-        "usage: flowjoin (--all | --workload w1|w2|w3|all --algo ref|conv|flow|all) "
-        "[--n N[,N...]] [--reps R] [--scale F | --reduced]\n");
+        "usage: flowjoin (--all | --workload w1|w2|w3|w4|w5|all --algo ref|conv|flow|qpsr|all) "
+        "[--n N[,N...]] [--reps R] [--scale F | --reduced] [--rho F] [--oversubscribe]\n");
     std::exit(2);
 }
 
@@ -94,6 +96,10 @@ static Options parse_args(int argc, char** argv) {
             opt.reduced = true;
             continue;
         }
+        if (flag == "--oversubscribe") {
+            opt.oversubscribe = true;
+            continue;
+        }
         if (i + 1 >= argc) print_usage_and_exit();
         std::string val = argv[++i];
 
@@ -107,6 +113,14 @@ static Options parse_args(int argc, char** argv) {
             std::vector<int> parsed = parse_int_list(val);
             if (parsed.size() != 1) print_usage_and_exit();
             opt.reps = parsed[0];
+        } else if (flag == "--rho") {
+            try {
+                size_t pos = 0;
+                opt.rho = std::stod(val, &pos);
+                if (pos != val.size() || opt.rho < 0.0 || opt.rho > 1.0) print_usage_and_exit();
+            } catch (...) {
+                print_usage_and_exit();
+            }
         } else if (flag == "--scale") {
             try {
                 size_t pos = 0;
@@ -135,6 +149,8 @@ static Workload build_workload(const std::string& name, const Config& cfg, const
     double scale = opt.reduced ? 0.01 : opt.scale;
     if (name == "w1") return make_w1(cfg, scale);
     if (name == "w2") return make_w2(cfg, scale);
+    if (name == "w4") return make_w4(cfg, scale, opt.rho);
+    if (name == "w5") return make_w5(cfg, scale, opt.rho);
     return make_w3(cfg, scale);
 }
 
@@ -161,11 +177,13 @@ static RunRecord run_once(const std::string& algo, const Workload& w, const Conf
         return rec;
     }
 
-    bool is_flow = (algo == "flow");
+    bool is_flow = (algo == "flow" || algo == "qpsr");
     WorkerFn worker = is_flow ? flow_join_worker : conventional_worker;
+    Config run_cfg = cfg;
+    run_cfg.qpsr = (algo == "qpsr");   // same worker; QPSR switches one routing decision
 
     double start_wall = wall_seconds();
-    ClusterRun run = run_cluster(w, cfg, worker);
+    ClusterRun run = run_cluster(w, run_cfg, worker);
     rec.time_ms = (wall_seconds() - start_wall) * 1000.0;
 
     // Verify invariants after stopping the timer.
@@ -289,12 +307,13 @@ static void record_and_print(FILE* results_csv, FILE* server_csv, bool& any_fail
     }
 
     // 4. Print Flow-Join diagnostics (heavy keys, held tuples, and SFR grids).
-    if (algo == "flow") {
-        uint64_t held_r = 0, held_s = 0, m_count = 0;
+    if (algo == "flow" || algo == "qpsr") {
+        uint64_t held_r = 0, held_s = 0, m_count = 0, rebal = 0;
         for (const Counters& c : med_all.servers) {
             held_r += c.held_r;
             held_s += c.held_s;
             m_count += c.m_entering_phase3;
+            rebal += c.shipped_rebalance;
         }
         std::string grids;
         for (const GridInfo& g : med_all.servers[0].grids) {
@@ -302,11 +321,11 @@ static void record_and_print(FILE* results_csv, FILE* server_csv, bool& any_fail
             grids += std::to_string(g.key) + ":" + std::to_string(g.rows) + "x" + std::to_string(g.cols);
         }
         std::printf(
-            "DIAG %s n=%d |L_R|=%zu |L_S|=%zu held_r=%llu held_s=%llu M=%llu "
+            "DIAG %s n=%d %s |L_R|=%zu |L_S|=%zu held_r=%llu held_s=%llu M=%llu rebalanced=%llu "
             "grids=%s L_R=%s L_S=%s\n",
-            wl_label.c_str(), n, med_all.heavy_r.size(), med_all.heavy_s.size(),
+            wl_label.c_str(), n, algo.c_str(), med_all.heavy_r.size(), med_all.heavy_s.size(),
             (unsigned long long)held_r, (unsigned long long)held_s, (unsigned long long)m_count,
-            grids.empty() ? "-" : grids.c_str(),
+            (unsigned long long)rebal, grids.empty() ? "-" : grids.c_str(),
             format_key_list(med_all.heavy_r).c_str(),
             format_key_list(med_all.heavy_s).c_str());
     }
@@ -360,7 +379,7 @@ int main(int argc, char** argv) {
     unsigned cores = std::thread::hardware_concurrency();
     std::printf("logical cores: %u\n", cores);
     for (int n : opt.server_counts) {
-        if (cores > 0 && static_cast<unsigned>(n) > cores) {
+        if (cores > 0 && static_cast<unsigned>(n) > cores && !opt.oversubscribe) {
             std::fprintf(stderr, "n=%d exceeds the %u logical cores; refusing to run\n", n, cores);
             return 2;
         }

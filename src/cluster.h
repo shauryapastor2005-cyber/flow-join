@@ -11,16 +11,28 @@
 #include "common.h"
 #include "workload.h"
 
-enum class Kind { InsertH, InsertHB, InsertHF, ProbeH, ProbeHF };
-const int kNumKinds = 5;
-enum class Ship { Unicast, SBroadcast, SelBcastR, SfrR, SfrS };   // which counter
+enum class Kind { InsertH, InsertHB, InsertHF, ProbeH, ProbeHF, ToM };   // ToM: QPSR moves an S tuple into M
+const int kNumKinds = 6;
+enum class Ship { Unicast, SBroadcast, SelBcastR, SfrR, SfrS, Rebalance };   // which counter
 enum class Relation { R = 0, S = 1 };
 
 struct KeyCount { uint64_t key = 0; uint64_t count = 0; };
 
 //n_s is #tuples scanned
 struct Report { bool present = false; uint64_t n_s = 0; std::vector<KeyCount> keys; };
-struct Install { bool present = false; std::vector<KeyCount> list; };
+struct Install {
+    bool present = false; std::vector<KeyCount> list;
+    std::vector<std::vector<uint64_t>> dist;   // QPSR only: dist[i][j] = server j's prefix count of list[i]
+};
+
+// QPSR: one server's plan for one heavy key
+struct QpsrPlan {
+    double f = 0.0;              // fraction of my tuples of this key to export (surplus / my count)
+    double credit = 0.0;         // deterministic fractional accumulator
+    std::vector<int> dest;       // deficit servers
+    std::vector<double> w;       // their normalized deficits
+    std::vector<double> cur;     // smooth weighted round-robin state
+};
  
 struct Batch { Kind kind = Kind::InsertH; std::vector<Tuple> tuples; };
 struct Mailbox { std::mutex mu; std::vector<Batch> batches; };
@@ -63,6 +75,8 @@ struct alignas(64) Server {   // one thread's private state
     std::vector<std::vector<Tuple>> out;    // index = dest * kNumKinds + kind
     Counters counters;
     JoinResult result;
+    bool qpsr = false; double qpsr_z = 2.0;             // QPSR extension switch
+    std::unordered_map<uint64_t, QpsrPlan> plan_r, plan_s;   // QPSR plans (empty in original)
 };
 
 // Probe table and emit 
@@ -80,6 +94,7 @@ inline void apply_tuple(Server& s, Kind kind, const Tuple& t) {
         case Kind::InsertHF: table_insert(s.h_f, t, s.counters); break;
         case Kind::ProbeH:   probe_table(s, s.h, t); break;     
         case Kind::ProbeHF:  probe_table(s, s.h_f, t); break;
+        case Kind::ToM:      s.m.push_back(t); break;   // QPSR surplus S tuple
     }
 }
 
@@ -98,8 +113,9 @@ inline void flush_buffer(Server& s, int dest, Kind kind) {
 inline void send(Server& s, int dest, Kind kind, Ship ship, const Tuple& t) {
     if (dest == s.id) { apply_tuple(s, kind, t); return; }   // to self: apply now
     Counters& c = s.counters;
-    uint64_t* const slots[5] = {&c.shipped_unicast, &c.shipped_s_broadcast,
-                                &c.shipped_sel_bcast_r, &c.shipped_sfr_r, &c.shipped_sfr_s};
+    uint64_t* const slots[6] = {&c.shipped_unicast, &c.shipped_s_broadcast,
+                                &c.shipped_sel_bcast_r, &c.shipped_sfr_r, &c.shipped_sfr_s,
+                                &c.shipped_rebalance};
     ++*slots[static_cast<int>(ship)];
     std::vector<Tuple>& buf = s.out[dest * kNumKinds + static_cast<int>(kind)];
     buf.push_back(t);
@@ -162,24 +178,27 @@ inline bool read_reports(Server& s, Relation rel, std::vector<Report>& out) {
 }
 
 // Server 0: send list to all
-inline void post_installs(Server& s, Relation rel, const std::vector<KeyCount>& list) {
+inline void post_installs(Server& s, Relation rel, const std::vector<KeyCount>& list,
+                          const std::vector<std::vector<uint64_t>>& dist = {}) {
     require(s.id == 0, "post_installs: only server 0 may install");
     ControlBoard& b = s.cluster->board;
     std::lock_guard<std::mutex> lock(b.mu);
     size_t first = slot_of(rel, s.n, 0);
     for (int i = 0; i < s.n; ++i) {
         Install& slot = b.installs[first + i];
-        slot.present = true; slot.list = list;
+        slot.present = true; slot.list = list; slot.dist = dist;
     }
 }
 
 // Read own install slot
-inline bool read_install(Server& s, Relation rel, std::vector<KeyCount>& out) {
+inline bool read_install(Server& s, Relation rel, std::vector<KeyCount>& out,
+                         std::vector<std::vector<uint64_t>>* dist = nullptr) {
     ControlBoard& b = s.cluster->board;
     std::lock_guard<std::mutex> lock(b.mu);
     const Install& slot = b.installs[slot_of(rel, s.n, s.id)];
     if (!slot.present) return false;   // not arrived yet
     out = slot.list;
+    if (dist != nullptr) *dist = slot.dist;
     return true;
 }
 
@@ -196,6 +215,7 @@ inline void init_server(Server& s, int id, const Config& cfg, Cluster* cluster) 
     s.id = id; s.n = cfg.n; s.batch_size = cfg.batch_size; s.cluster = cluster;
     s.out.assign(static_cast<size_t>(cfg.n) * kNumKinds, std::vector<Tuple>());
     s.det_r.hist = make_space_saving(cfg.k); s.det_s.hist = make_space_saving(cfg.k);
+    s.qpsr = cfg.qpsr; s.qpsr_z = cfg.qpsr_z;
 }
 
 // Run threads, merge results

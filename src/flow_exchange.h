@@ -16,6 +16,8 @@ inline void route_r_before_install(Server& s, const Tuple& t, bool hot) {
 // After L_R is known, only membership in L_R decides, no local count.
 inline void route_r_after_install(Server& s, const Tuple& t) {
     if (s.l_r.count(t.key) != 0) {   //heavy key
+        int d = qpsr_dest(s, Relation::R, t.key);   // QPSR: surplus above quota leaves
+        if (d >= 0) { send(s, d, Kind::InsertH, Ship::Rebalance, t); return; }
         table_insert(s.h, t, s.counters);
         return;
     }
@@ -51,6 +53,8 @@ inline void route_s_before_install(Server& s, const Tuple& t, bool hot) {
 // after L_S is known 
 inline void route_s_after_install(Server& s, const Tuple& t) {
     if (s.l_s.count(t.key) != 0) {   //  materialize in M
+        int d = qpsr_dest(s, Relation::S, t.key);   // QPSR: surplus above quota goes to a deficit M
+        if (d >= 0) { send(s, d, Kind::ToM, Ship::Rebalance, t); return; }
         s.m.push_back(t);
         return;
     }

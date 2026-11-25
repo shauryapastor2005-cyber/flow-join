@@ -1,0 +1,438 @@
+diff -ru /home/claude/work/baseline_copy/src/cluster.h src/cluster.h
+--- /home/claude/work/baseline_copy/src/cluster.h	2026-11-25 20:45:14.960583862 +0530
++++ src/cluster.h	2026-11-25 20:47:33.035635926 +0530
+@@ -11,16 +11,28 @@
+ #include "common.h"
+ #include "workload.h"
+ 
+-enum class Kind { InsertH, InsertHB, InsertHF, ProbeH, ProbeHF };
+-const int kNumKinds = 5;
+-enum class Ship { Unicast, SBroadcast, SelBcastR, SfrR, SfrS };   // which counter
++enum class Kind { InsertH, InsertHB, InsertHF, ProbeH, ProbeHF, ToM };   // ToM: QPSR moves an S tuple into M
++const int kNumKinds = 6;
++enum class Ship { Unicast, SBroadcast, SelBcastR, SfrR, SfrS, Rebalance };   // which counter
+ enum class Relation { R = 0, S = 1 };
+ 
+ struct KeyCount { uint64_t key = 0; uint64_t count = 0; };
+ 
+ //n_s is #tuples scanned
+ struct Report { bool present = false; uint64_t n_s = 0; std::vector<KeyCount> keys; };
+-struct Install { bool present = false; std::vector<KeyCount> list; };
++struct Install {
++    bool present = false; std::vector<KeyCount> list;
++    std::vector<std::vector<uint64_t>> dist;   // QPSR only: dist[i][j] = server j's prefix count of list[i]
++};
++
++// QPSR: one server's plan for one heavy key
++struct QpsrPlan {
++    double f = 0.0;              // fraction of my tuples of this key to export (surplus / my count)
++    double credit = 0.0;         // deterministic fractional accumulator
++    std::vector<int> dest;       // deficit servers
++    std::vector<double> w;       // their normalized deficits
++    std::vector<double> cur;     // smooth weighted round-robin state
++};
+  
+ struct Batch { Kind kind = Kind::InsertH; std::vector<Tuple> tuples; };
+ struct Mailbox { std::mutex mu; std::vector<Batch> batches; };
+@@ -63,6 +75,8 @@
+     std::vector<std::vector<Tuple>> out;    // index = dest * kNumKinds + kind
+     Counters counters;
+     JoinResult result;
++    bool qpsr = false; double qpsr_z = 2.0;             // QPSR extension switch
++    std::unordered_map<uint64_t, QpsrPlan> plan_r, plan_s;   // QPSR plans (empty in original)
+ };
+ 
+ // Probe table and emit 
+@@ -80,6 +94,7 @@
+         case Kind::InsertHF: table_insert(s.h_f, t, s.counters); break;
+         case Kind::ProbeH:   probe_table(s, s.h, t); break;     
+         case Kind::ProbeHF:  probe_table(s, s.h_f, t); break;
++        case Kind::ToM:      s.m.push_back(t); break;   // QPSR surplus S tuple
+     }
+ }
+ 
+@@ -98,8 +113,9 @@
+ inline void send(Server& s, int dest, Kind kind, Ship ship, const Tuple& t) {
+     if (dest == s.id) { apply_tuple(s, kind, t); return; }   // to self: apply now
+     Counters& c = s.counters;
+-    uint64_t* const slots[5] = {&c.shipped_unicast, &c.shipped_s_broadcast,
+-                                &c.shipped_sel_bcast_r, &c.shipped_sfr_r, &c.shipped_sfr_s};
++    uint64_t* const slots[6] = {&c.shipped_unicast, &c.shipped_s_broadcast,
++                                &c.shipped_sel_bcast_r, &c.shipped_sfr_r, &c.shipped_sfr_s,
++                                &c.shipped_rebalance};
+     ++*slots[static_cast<int>(ship)];
+     std::vector<Tuple>& buf = s.out[dest * kNumKinds + static_cast<int>(kind)];
+     buf.push_back(t);
+@@ -162,24 +178,27 @@
+ }
+ 
+ // Server 0: send list to all
+-inline void post_installs(Server& s, Relation rel, const std::vector<KeyCount>& list) {
++inline void post_installs(Server& s, Relation rel, const std::vector<KeyCount>& list,
++                          const std::vector<std::vector<uint64_t>>& dist = {}) {
+     require(s.id == 0, "post_installs: only server 0 may install");
+     ControlBoard& b = s.cluster->board;
+     std::lock_guard<std::mutex> lock(b.mu);
+     size_t first = slot_of(rel, s.n, 0);
+     for (int i = 0; i < s.n; ++i) {
+         Install& slot = b.installs[first + i];
+-        slot.present = true; slot.list = list;
++        slot.present = true; slot.list = list; slot.dist = dist;
+     }
+ }
+ 
+ // Read own install slot
+-inline bool read_install(Server& s, Relation rel, std::vector<KeyCount>& out) {
++inline bool read_install(Server& s, Relation rel, std::vector<KeyCount>& out,
++                         std::vector<std::vector<uint64_t>>* dist = nullptr) {
+     ControlBoard& b = s.cluster->board;
+     std::lock_guard<std::mutex> lock(b.mu);
+     const Install& slot = b.installs[slot_of(rel, s.n, s.id)];
+     if (!slot.present) return false;   // not arrived yet
+     out = slot.list;
++    if (dist != nullptr) *dist = slot.dist;
+     return true;
+ }
+ 
+@@ -196,6 +215,7 @@
+     s.id = id; s.n = cfg.n; s.batch_size = cfg.batch_size; s.cluster = cluster;
+     s.out.assign(static_cast<size_t>(cfg.n) * kNumKinds, std::vector<Tuple>());
+     s.det_r.hist = make_space_saving(cfg.k); s.det_s.hist = make_space_saving(cfg.k);
++    s.qpsr = cfg.qpsr; s.qpsr_z = cfg.qpsr_z;
+ }
+ 
+ // Run threads, merge results
+diff -ru /home/claude/work/baseline_copy/src/common.h src/common.h
+--- /home/claude/work/baseline_copy/src/common.h	2026-11-25 20:45:14.960916523 +0530
++++ src/common.h	2026-11-25 20:50:59.803005794 +0530
+@@ -22,6 +22,9 @@
+     size_t morsel_size = 4096; // tuples per scan morsel
+     size_t batch_size = 1024;  // tuples per network batch
+     uint64_t seed = 1;
++    // QPSR extension (off = original Flow-Join)
++    bool qpsr = false;         // Quota-Planned Surplus Routing of heavy tuples
++    double qpsr_z = 2.0;       // significance gate: move only if surplus > z*sqrt(prefix count)
+ };
+ 
+ struct JoinResult {
+@@ -80,6 +83,7 @@
+     uint64_t shipped_sel_bcast_r = 0;  // selective-broadcast R copies
+     uint64_t shipped_sfr_r = 0;        // SFR R copies
+     uint64_t shipped_sfr_s = 0;        // SFR S copies
++    uint64_t shipped_rebalance = 0;    // QPSR surplus moves (0 in original Flow-Join)
+     // Flow-Join diagnostics
+     uint64_t l_r = 0;                      // |L_R|
+     uint64_t l_s = 0;                      // |L_S|
+@@ -93,7 +97,7 @@
+ 
+ inline uint64_t shipped_total(const Counters& c) {
+     return c.shipped_unicast + c.shipped_s_broadcast + c.shipped_sel_bcast_r + c.shipped_sfr_r +
+-           c.shipped_sfr_s;
++           c.shipped_sfr_s + c.shipped_rebalance;
+ }
+ 
+ // Timers
+diff -ru /home/claude/work/baseline_copy/src/consensus.h src/consensus.h
+--- /home/claude/work/baseline_copy/src/consensus.h	2026-11-25 20:45:14.960727211 +0530
++++ src/consensus.h	2026-11-25 20:50:59.802658968 +0530
+@@ -48,6 +48,69 @@
+     return list;
+ }
+ 
++// ---- QPSR: Quota-Planned Surplus Routing ----
++// Coordinator: keep the per-server breakdown that merge_reports sums away. 0 = not locally heavy.
++inline std::vector<std::vector<uint64_t>> merge_distribution(const std::vector<Report>& reports,
++                                                             const std::vector<KeyCount>& list) {
++    std::unordered_map<uint64_t, size_t> row;
++    for (size_t i = 0; i < list.size(); ++i) row[list[i].key] = i;
++    std::vector<std::vector<uint64_t>> dist(list.size(), std::vector<uint64_t>(reports.size(), 0));
++    for (size_t j = 0; j < reports.size(); ++j)
++        for (const KeyCount& kc : reports[j].keys) {
++            auto it = row.find(kc.key);
++            if (it != row.end()) dist[it->second][j] = kc.count;
++        }
++    return dist;
++}
++
++// Every server derives its own plan from the same installed distribution (deterministic).
++// quota q = total/n; export the surplus c_i - q only if it is significant (> z*sqrt(c_i));
++// receivers are deficit servers, weighted by their deficit q - c_j.
++inline void qpsr_build_plans(Server& s, std::unordered_map<uint64_t, QpsrPlan>& plans,
++                             const std::vector<KeyCount>& list,
++                             const std::vector<std::vector<uint64_t>>& dist) {
++    plans.clear();
++    for (size_t i = 0; i < list.size(); ++i) {
++        const std::vector<uint64_t>& c = dist[i];
++        double total = 0.0;
++        for (uint64_t v : c) total += double(v);
++        double q = total / double(s.n);
++        double mine = double(c[s.id]);
++        double excess = mine - q;
++        // significance gate: an excess within z binomial std devs of the prefix count is sampling
++        // noise -> keep local (original behaviour); otherwise export the full excess.
++        if (mine <= 0.0 || excess <= s.qpsr_z * std::sqrt(mine)) continue;
++        QpsrPlan p;
++        p.f = excess / mine;
++        double wsum = 0.0;
++        for (int j = 0; j < s.n; ++j)
++            if (double(c[j]) < q) { p.dest.push_back(j); p.w.push_back(q - double(c[j])); wsum += q - double(c[j]); }
++        if (p.dest.empty()) continue;
++        for (double& x : p.w) x /= wsum;
++        p.cur.assign(p.dest.size(), 0.0);
++        plans[list[i].key] = std::move(p);
++    }
++}
++
++// Decision point: -1 = keep local (original), otherwise the deficit server to route this tuple to.
++inline int qpsr_dest(Server& s, Relation rel, uint64_t key) {
++    if (!s.qpsr) return -1;
++    std::unordered_map<uint64_t, QpsrPlan>& plans = rel == Relation::R ? s.plan_r : s.plan_s;
++    auto it = plans.find(key);
++    if (it == plans.end()) return -1;
++    QpsrPlan& p = it->second;
++    p.credit += p.f;
++    if (p.credit < 1.0) return -1;
++    p.credit -= 1.0;
++    size_t best = 0;   // smooth weighted round-robin over deficit servers
++    for (size_t j = 0; j < p.dest.size(); ++j) {
++        p.cur[j] += p.w[j];
++        if (p.cur[j] > p.cur[best]) best = j;
++    }
++    p.cur[best] -= 1.0;
++    return p.dest[best];
++}
++
+ inline Detector& detector_of(Server& s, Relation rel) {
+     return rel == Relation::R ? s.det_r : s.det_s;
+ }
+@@ -96,16 +159,20 @@
+     Detector& det = detector_of(s, rel);
+     std::vector<Report> reports;
+     if (s.id == 0 && !det.consensus_done && read_reports(s, rel, reports)) {   // all n reports in
+-        post_installs(s, rel, merge_reports(reports, cfg.theta));   
++        std::vector<KeyCount> list = merge_reports(reports, cfg.theta);
++        if (s.qpsr) post_installs(s, rel, list, merge_distribution(reports, list));   // QPSR: + distribution
++        else post_installs(s, rel, list);
+         det.consensus_done = true;
+     }
+     std::vector<KeyCount> install;
+-    if (det.installed || !read_install(s, rel, install)) return false; // already installed or install not arrived then skip
++    std::vector<std::vector<uint64_t>> dist;
++    if (det.installed || !read_install(s, rel, install, &dist)) return false; // already installed or install not arrived then skip
+     std::unordered_map<uint64_t, uint64_t>& heavy = list_of(s, rel);   
+     heavy.clear();
+     for (const KeyCount& kc : install) {
+         heavy[kc.key] = kc.count;
+     }
++    if (s.qpsr) qpsr_build_plans(s, rel == Relation::R ? s.plan_r : s.plan_s, install, dist);
+     det.installed = true; //installed successfully.   
+     if (rel == Relation::R) {
+         s.counters.l_r = install.size();
+diff -ru /home/claude/work/baseline_copy/src/flow_exchange.h src/flow_exchange.h
+--- /home/claude/work/baseline_copy/src/flow_exchange.h	2026-11-25 20:45:14.961150641 +0530
++++ src/flow_exchange.h	2026-11-25 20:47:50.236791856 +0530
+@@ -16,6 +16,8 @@
+ // After L_R is known, only membership in L_R decides, no local count.
+ inline void route_r_after_install(Server& s, const Tuple& t) {
+     if (s.l_r.count(t.key) != 0) {   //heavy key
++        int d = qpsr_dest(s, Relation::R, t.key);   // QPSR: surplus above quota leaves
++        if (d >= 0) { send(s, d, Kind::InsertH, Ship::Rebalance, t); return; }
+         table_insert(s.h, t, s.counters);
+         return;
+     }
+@@ -51,6 +53,8 @@
+ // after L_S is known 
+ inline void route_s_after_install(Server& s, const Tuple& t) {
+     if (s.l_s.count(t.key) != 0) {   //  materialize in M
++        int d = qpsr_dest(s, Relation::S, t.key);   // QPSR: surplus above quota goes to a deficit M
++        if (d >= 0) { send(s, d, Kind::ToM, Ship::Rebalance, t); return; }
+         s.m.push_back(t);
+         return;
+     }
+diff -ru /home/claude/work/baseline_copy/src/workload.h src/workload.h
+--- /home/claude/work/baseline_copy/src/workload.h	2026-11-25 20:45:14.960828240 +0530
++++ src/workload.h	2026-11-25 20:48:15.733186127 +0530
+@@ -156,6 +156,59 @@
+     return w;
+ }
+ 
++// ---- Partition-correlated (tuple-placement) skew: same key multiset, different placement ----
++// A fraction rho of heavy key h[j]'s tuples goes to home fragment j % n, the rest to uniformly random
++// fragments (a full fragment spills to the next). Light tuples fill fragments to the cut_fragments
++// sizes; each fragment is shuffled internally. Frequencies and expected output are unchanged.
++inline std::vector<std::vector<Tuple>> place_clustered(const std::vector<std::vector<Tuple>>& frags_in,
++                                                       const std::array<uint64_t, 3>& h, double rho,
++                                                       Rng& rng) {
++    int n = static_cast<int>(frags_in.size());
++    std::vector<uint64_t> heavy, light;
++    std::vector<size_t> cap;
++    for (const auto& f : frags_in) {
++        cap.push_back(f.size());
++        for (const Tuple& t : f) (t.key == h[0] || t.key == h[1] || t.key == h[2] ? heavy : light).push_back(t.key);
++    }
++    std::sort(heavy.begin(), heavy.end());   // deterministic order before the random placement
++    std::vector<std::vector<uint64_t>> keys(static_cast<size_t>(n));
++    for (uint64_t k : heavy) {
++        int home = k == h[0] ? 0 : (k == h[1] ? 1 : 2);
++        double u = double(rng_next(rng) >> 11) * (1.0 / 9007199254740992.0);
++        int f = (u < rho) ? home % n : static_cast<int>(rng_below(rng, static_cast<uint64_t>(n)));
++        while (keys[f].size() >= cap[f]) f = (f + 1) % n;   // spill if full
++        keys[f].push_back(k);
++    }
++    shuffle_keys(light, rng);
++    size_t li = 0;
++    for (int f = 0; f < n; ++f) {
++        while (keys[f].size() < cap[f]) keys[f].push_back(light[li++]);
++        shuffle_keys(keys[f], rng);
++    }
++    std::vector<std::vector<Tuple>> out(static_cast<size_t>(n));
++    uint64_t pos = 0;
++    for (int f = 0; f < n; ++f)
++        for (uint64_t k : keys[f]) out[f].push_back(Tuple{k, pos++});
++    return out;
++}
++
++inline Workload make_clustered(Workload w, const Config& cfg, double rho) {
++    Rng rng = rng_seed(cfg.seed ^ 0xC1A57E2ULL);
++    w.frag_R = place_clustered(w.frag_R, w.heavy, rho, rng);
++    w.frag_S = place_clustered(w.frag_S, w.heavy, rho, rng);
++    return w;
++}
++
++// W4: W3's keys (two-sided skew, SFR path) with clustered placement.
++inline Workload make_w4(const Config& cfg, double size_factor, double rho) {
++    return make_clustered(make_w3(cfg, size_factor), cfg, rho);
++}
++
++// W5: W2's keys (S-only skew, selective-broadcast path) with clustered placement.
++inline Workload make_w5(const Config& cfg, double scale, double rho) {
++    return make_clustered(make_w2(cfg, scale), cfg, rho);
++}
++
+ // Single-threaded hash join over all of R and S
+ inline JoinResult reference_join(const Workload& w, Counters& c) {
+     Table h;
+--- /home/claude/work/baseline_copy/benchmarks/benchmark.cpp	2026-11-25 20:45:14.937024417 +0530
++++ benchmarks/benchmark.cpp	2026-11-25 20:48:15.737012863 +0530
+@@ -12,8 +12,8 @@
+ #include <thread>
+ #include <vector>
+ 
+-const std::vector<std::string> ALL_WORKLOADS = {"w1", "w2", "w3"};
+-const std::vector<std::string> ALL_ALGOS     = {"ref", "conv", "flow"};
++const std::vector<std::string> ALL_WORKLOADS = {"w1", "w2", "w3", "w4", "w5"};   // w4/w5: clustered placement
++const std::vector<std::string> ALL_ALGOS     = {"ref", "conv", "flow", "qpsr"};  // qpsr: Flow-Join + QPSR
+ 
+ struct Options {
+     std::vector<std::string> workloads;
+@@ -23,6 +23,8 @@
+     double scale = 1.0;
+     bool scale_set = false;
+     bool reduced = false;
++    double rho = 1.0;            // w4/w5: clustered fraction of heavy tuples
++    bool oversubscribe = false;  // allow n > cores (work/shipping metrics only; timings invalid)
+ };
+ 
+ struct RunRecord {
+@@ -44,8 +46,8 @@
+ 
+ static void print_usage_and_exit() {
+     std::fprintf(stderr,
+-        "usage: flowjoin (--all | --workload w1|w2|w3|all --algo ref|conv|flow|all) "
+-        "[--n N[,N...]] [--reps R] [--scale F | --reduced]\n");
++        "usage: flowjoin (--all | --workload w1|w2|w3|w4|w5|all --algo ref|conv|flow|qpsr|all) "
++        "[--n N[,N...]] [--reps R] [--scale F | --reduced] [--rho F] [--oversubscribe]\n");
+     std::exit(2);
+ }
+ 
+@@ -94,6 +96,10 @@
+             opt.reduced = true;
+             continue;
+         }
++        if (flag == "--oversubscribe") {
++            opt.oversubscribe = true;
++            continue;
++        }
+         if (i + 1 >= argc) print_usage_and_exit();
+         std::string val = argv[++i];
+ 
+@@ -107,6 +113,14 @@
+             std::vector<int> parsed = parse_int_list(val);
+             if (parsed.size() != 1) print_usage_and_exit();
+             opt.reps = parsed[0];
++        } else if (flag == "--rho") {
++            try {
++                size_t pos = 0;
++                opt.rho = std::stod(val, &pos);
++                if (pos != val.size() || opt.rho < 0.0 || opt.rho > 1.0) print_usage_and_exit();
++            } catch (...) {
++                print_usage_and_exit();
++            }
+         } else if (flag == "--scale") {
+             try {
+                 size_t pos = 0;
+@@ -135,6 +149,8 @@
+     double scale = opt.reduced ? 0.01 : opt.scale;
+     if (name == "w1") return make_w1(cfg, scale);
+     if (name == "w2") return make_w2(cfg, scale);
++    if (name == "w4") return make_w4(cfg, scale, opt.rho);
++    if (name == "w5") return make_w5(cfg, scale, opt.rho);
+     return make_w3(cfg, scale);
+ }
+ 
+@@ -161,11 +177,13 @@
+         return rec;
+     }
+ 
+-    bool is_flow = (algo == "flow");
++    bool is_flow = (algo == "flow" || algo == "qpsr");
+     WorkerFn worker = is_flow ? flow_join_worker : conventional_worker;
++    Config run_cfg = cfg;
++    run_cfg.qpsr = (algo == "qpsr");   // same worker; QPSR switches one routing decision
+ 
+     double start_wall = wall_seconds();
+-    ClusterRun run = run_cluster(w, cfg, worker);
++    ClusterRun run = run_cluster(w, run_cfg, worker);
+     rec.time_ms = (wall_seconds() - start_wall) * 1000.0;
+ 
+     // Verify invariants after stopping the timer.
+@@ -289,12 +307,13 @@
+     }
+ 
+     // 4. Print Flow-Join diagnostics (heavy keys, held tuples, and SFR grids).
+-    if (algo == "flow") {
+-        uint64_t held_r = 0, held_s = 0, m_count = 0;
++    if (algo == "flow" || algo == "qpsr") {
++        uint64_t held_r = 0, held_s = 0, m_count = 0, rebal = 0;
+         for (const Counters& c : med_all.servers) {
+             held_r += c.held_r;
+             held_s += c.held_s;
+             m_count += c.m_entering_phase3;
++            rebal += c.shipped_rebalance;
+         }
+         std::string grids;
+         for (const GridInfo& g : med_all.servers[0].grids) {
+@@ -302,11 +321,11 @@
+             grids += std::to_string(g.key) + ":" + std::to_string(g.rows) + "x" + std::to_string(g.cols);
+         }
+         std::printf(
+-            "DIAG %s n=%d |L_R|=%zu |L_S|=%zu held_r=%llu held_s=%llu M=%llu "
++            "DIAG %s n=%d %s |L_R|=%zu |L_S|=%zu held_r=%llu held_s=%llu M=%llu rebalanced=%llu "
+             "grids=%s L_R=%s L_S=%s\n",
+-            wl_label.c_str(), n, med_all.heavy_r.size(), med_all.heavy_s.size(),
++            wl_label.c_str(), n, algo.c_str(), med_all.heavy_r.size(), med_all.heavy_s.size(),
+             (unsigned long long)held_r, (unsigned long long)held_s, (unsigned long long)m_count,
+-            grids.empty() ? "-" : grids.c_str(),
++            (unsigned long long)rebal, grids.empty() ? "-" : grids.c_str(),
+             format_key_list(med_all.heavy_r).c_str(),
+             format_key_list(med_all.heavy_s).c_str());
+     }
+@@ -360,7 +379,7 @@
+     unsigned cores = std::thread::hardware_concurrency();
+     std::printf("logical cores: %u\n", cores);
+     for (int n : opt.server_counts) {
+-        if (cores > 0 && static_cast<unsigned>(n) > cores) {
++        if (cores > 0 && static_cast<unsigned>(n) > cores && !opt.oversubscribe) {
+             std::fprintf(stderr, "n=%d exceeds the %u logical cores; refusing to run\n", n, cores);
+             return 2;
+         }

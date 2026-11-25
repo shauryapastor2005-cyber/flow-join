@@ -22,6 +22,9 @@ struct Config {
     size_t morsel_size = 4096; // tuples per scan morsel
     size_t batch_size = 1024;  // tuples per network batch
     uint64_t seed = 1;
+    // QPSR extension (off = original Flow-Join)
+    bool qpsr = false;         // Quota-Planned Surplus Routing of heavy tuples
+    double qpsr_z = 2.0;       // significance gate: move only if surplus > z*sqrt(prefix count)
 };
 
 struct JoinResult {
@@ -80,6 +83,7 @@ struct Counters {
     uint64_t shipped_sel_bcast_r = 0;  // selective-broadcast R copies
     uint64_t shipped_sfr_r = 0;        // SFR R copies
     uint64_t shipped_sfr_s = 0;        // SFR S copies
+    uint64_t shipped_rebalance = 0;    // QPSR surplus moves (0 in original Flow-Join)
     // Flow-Join diagnostics
     uint64_t l_r = 0;                      // |L_R|
     uint64_t l_s = 0;                      // |L_S|
@@ -93,7 +97,7 @@ struct Counters {
 
 inline uint64_t shipped_total(const Counters& c) {
     return c.shipped_unicast + c.shipped_s_broadcast + c.shipped_sel_bcast_r + c.shipped_sfr_r +
-           c.shipped_sfr_s;
+           c.shipped_sfr_s + c.shipped_rebalance;
 }
 
 // Timers

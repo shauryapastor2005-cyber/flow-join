@@ -156,6 +156,59 @@ inline Workload make_w3(const Config& cfg, double size_factor) {
     return w;
 }
 
+// ---- Partition-correlated (tuple-placement) skew: same key multiset, different placement ----
+// A fraction rho of heavy key h[j]'s tuples goes to home fragment j % n, the rest to uniformly random
+// fragments (a full fragment spills to the next). Light tuples fill fragments to the cut_fragments
+// sizes; each fragment is shuffled internally. Frequencies and expected output are unchanged.
+inline std::vector<std::vector<Tuple>> place_clustered(const std::vector<std::vector<Tuple>>& frags_in,
+                                                       const std::array<uint64_t, 3>& h, double rho,
+                                                       Rng& rng) {
+    int n = static_cast<int>(frags_in.size());
+    std::vector<uint64_t> heavy, light;
+    std::vector<size_t> cap;
+    for (const auto& f : frags_in) {
+        cap.push_back(f.size());
+        for (const Tuple& t : f) (t.key == h[0] || t.key == h[1] || t.key == h[2] ? heavy : light).push_back(t.key);
+    }
+    std::sort(heavy.begin(), heavy.end());   // deterministic order before the random placement
+    std::vector<std::vector<uint64_t>> keys(static_cast<size_t>(n));
+    for (uint64_t k : heavy) {
+        int home = k == h[0] ? 0 : (k == h[1] ? 1 : 2);
+        double u = double(rng_next(rng) >> 11) * (1.0 / 9007199254740992.0);
+        int f = (u < rho) ? home % n : static_cast<int>(rng_below(rng, static_cast<uint64_t>(n)));
+        while (keys[f].size() >= cap[f]) f = (f + 1) % n;   // spill if full
+        keys[f].push_back(k);
+    }
+    shuffle_keys(light, rng);
+    size_t li = 0;
+    for (int f = 0; f < n; ++f) {
+        while (keys[f].size() < cap[f]) keys[f].push_back(light[li++]);
+        shuffle_keys(keys[f], rng);
+    }
+    std::vector<std::vector<Tuple>> out(static_cast<size_t>(n));
+    uint64_t pos = 0;
+    for (int f = 0; f < n; ++f)
+        for (uint64_t k : keys[f]) out[f].push_back(Tuple{k, pos++});
+    return out;
+}
+
+inline Workload make_clustered(Workload w, const Config& cfg, double rho) {
+    Rng rng = rng_seed(cfg.seed ^ 0xC1A57E2ULL);
+    w.frag_R = place_clustered(w.frag_R, w.heavy, rho, rng);
+    w.frag_S = place_clustered(w.frag_S, w.heavy, rho, rng);
+    return w;
+}
+
+// W4: W3's keys (two-sided skew, SFR path) with clustered placement.
+inline Workload make_w4(const Config& cfg, double size_factor, double rho) {
+    return make_clustered(make_w3(cfg, size_factor), cfg, rho);
+}
+
+// W5: W2's keys (S-only skew, selective-broadcast path) with clustered placement.
+inline Workload make_w5(const Config& cfg, double scale, double rho) {
+    return make_clustered(make_w2(cfg, scale), cfg, rho);
+}
+
 // Single-threaded hash join over all of R and S
 inline JoinResult reference_join(const Workload& w, Counters& c) {
     Table h;

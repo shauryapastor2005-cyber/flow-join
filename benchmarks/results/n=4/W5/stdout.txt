@@ -1,0 +1,36 @@
+### tier=T1 scale=1 n=4 workload=W5 exit=0
+logical cores: 10
+SUMMARY W5 n=4 ref time_ms median=23.923 min=23.516 max=26.042 speedup=1.000 work_imb=1.000 cpu_imb=1.000 shipped=0 correct=3/3
+SUMMARY W5 n=4 conv time_ms median=13.773 min=13.319 max=13.984 speedup=1.737 work_imb=1.768 cpu_imb=1.110 shipped=1825501 correct=3/3
+SUMMARY W5 n=4 flow time_ms median=21.659 min=21.526 max=21.797 speedup=1.105 work_imb=1.773 cpu_imb=1.042 shipped=1125693 correct=3/3
+DIAG W5 n=4 flow |L_R|=0 |L_S|=3 held_r=18432 held_s=29434 M=699853 rebalanced=0 grids=- L_R=- L_S=1,2,4
+SUMMARY W5 n=4 qpsr time_ms median=20.849 min=20.030 max=21.727 speedup=1.147 work_imb=1.001 cpu_imb=1.028 shipped=1650582 correct=3/3
+DIAG W5 n=4 qpsr |L_R|=0 |L_S|=3 held_r=26624 held_s=29434 M=699853 rebalanced=524889 grids=- L_R=- L_S=1,2,4
+
+### tier=T2 scale=5 n=4 workload=W5 exit=0
+logical cores: 10
+SUMMARY W5 n=4 ref time_ms median=375.512 min=372.285 max=376.700 speedup=1.000 work_imb=1.000 cpu_imb=1.000 shipped=0 correct=3/3
+SUMMARY W5 n=4 conv time_ms median=186.737 min=181.250 max=187.921 speedup=2.011 work_imb=1.769 cpu_imb=1.088 shipped=9125469 correct=3/3
+SUMMARY W5 n=4 flow time_ms median=213.712 min=213.558 max=214.713 speedup=1.757 work_imb=1.773 cpu_imb=1.053 shipped=5626261 correct=3/3
+DIAG W5 n=4 flow |L_R|=0 |L_S|=3 held_r=12288 held_s=110688 M=3499253 rebalanced=0 grids=- L_R=- L_S=1,2,4
+SUMMARY W5 n=4 qpsr time_ms median=209.651 min=206.510 max=211.366 speedup=1.791 work_imb=1.001 cpu_imb=1.044 shipped=8250700 correct=3/3
+DIAG W5 n=4 qpsr |L_R|=0 |L_S|=3 held_r=16384 held_s=115563 M=3499253 rebalanced=2624439 grids=- L_R=- L_S=1,2,4
+
+### tier=T3 scale=10 n=4 workload=W5 exit=0
+logical cores: 10
+SUMMARY W5 n=4 ref time_ms median=954.918 min=927.864 max=973.089 speedup=1.000 work_imb=1.000 cpu_imb=1.000 shipped=0 correct=3/3
+SUMMARY W5 n=4 conv time_ms median=445.666 min=440.336 max=446.563 speedup=2.143 work_imb=1.770 cpu_imb=1.065 shipped=18254629 correct=3/3
+SUMMARY W5 n=4 flow time_ms median=503.365 min=503.090 max=503.403 speedup=1.897 work_imb=1.772 cpu_imb=1.054 shipped=11256171 correct=3/3
+DIAG W5 n=4 flow |L_R|=0 |L_S|=3 held_r=11776 held_s=224303 M=6998503 rebalanced=0 grids=- L_R=- L_S=1,2,4
+SUMMARY W5 n=4 qpsr time_ms median=501.524 min=496.619 max=501.697 speedup=1.904 work_imb=1.001 cpu_imb=1.051 shipped=16505046 correct=3/3
+DIAG W5 n=4 qpsr |L_R|=0 |L_S|=3 held_r=7680 held_s=224303 M=6998503 rebalanced=5248875 grids=- L_R=- L_S=1,2,4
+
+### tier=T4 scale=20 n=4 workload=W5 exit=0
+logical cores: 10
+SUMMARY W5 n=4 ref time_ms median=2179.074 min=2126.335 max=2204.407 speedup=1.000 work_imb=1.000 cpu_imb=1.000 shipped=0 correct=3/3
+SUMMARY W5 n=4 conv time_ms median=1005.742 min=998.730 max=1010.619 speedup=2.167 work_imb=1.771 cpu_imb=1.071 shipped=36496406 correct=3/3
+SUMMARY W5 n=4 flow time_ms median=1121.566 min=1121.320 max=1122.541 speedup=1.943 work_imb=1.771 cpu_imb=1.071 shipped=22499448 correct=3/3
+DIAG W5 n=4 flow |L_R|=0 |L_S|=3 held_r=3712 held_s=444342 M=13997003 rebalanced=0 grids=- L_R=- L_S=1,2,4
+SUMMARY W5 n=4 qpsr time_ms median=1108.942 min=1107.298 max=1110.387 speedup=1.965 work_imb=1.000 cpu_imb=1.050 shipped=32997198 correct=3/3
+DIAG W5 n=4 qpsr |L_R|=0 |L_S|=3 held_r=7424 held_s=448392 M=13997003 rebalanced=10497750 grids=- L_R=- L_S=1,2,4
+

@@ -48,6 +48,67 @@ inline std::vector<KeyCount> merge_reports(const std::vector<Report>& reports, d
     return list;
 }
 
+// QPSR: Quota-Planned Surplus Routing 
+// Coordinator: keep the per-server breakdown that merge_reports sums away. 0 = not locally heavy.
+inline std::vector<std::vector<uint64_t>> merge_distribution(const std::vector<Report>& reports,
+                                                             const std::vector<KeyCount>& list) {
+    std::unordered_map<uint64_t, size_t> row;
+    for (size_t i = 0; i < list.size(); ++i) row[list[i].key] = i;
+    std::vector<std::vector<uint64_t>> dist(list.size(), std::vector<uint64_t>(reports.size(), 0));
+    for (size_t j = 0; j < reports.size(); ++j)
+        for (const KeyCount& kc : reports[j].keys) {
+            auto it = row.find(kc.key);
+            if (it != row.end()) dist[it->second][j] = kc.count;
+        }
+    return dist;
+}
+
+// Every server derives its own plan from the same installed distribution (deterministic).
+// quota q = total/n; export the surplus c_i - q only if it is significant (> z*sqrt(c_i));
+// receivers are deficit servers, weighted by their deficit q - c_j.
+inline void qpsr_build_plans(Server& s, std::unordered_map<uint64_t, QpsrPlan>& plans,
+                             const std::vector<KeyCount>& list,
+                             const std::vector<std::vector<uint64_t>>& dist) {
+    plans.clear();
+    for (size_t i = 0; i < list.size(); ++i) {
+        const std::vector<uint64_t>& c = dist[i];
+        double total = 0.0;
+        for (uint64_t v : c) total += double(v);
+        double q = total / double(s.n);
+        double mine = double(c[s.id]);
+        double excess = mine - q;
+        if (mine <= 0.0 || excess <= s.qpsr_z * std::sqrt(mine)) continue;
+        QpsrPlan p;
+        p.f = excess / mine;
+        double wsum = 0.0;
+        for (int j = 0; j < s.n; ++j)
+            if (double(c[j]) < q) { p.dest.push_back(j); p.w.push_back(q - double(c[j])); wsum += q - double(c[j]); }
+        if (p.dest.empty()) continue;
+        for (double& x : p.w) x /= wsum;
+        p.cur.assign(p.dest.size(), 0.0);
+        plans[list[i].key] = std::move(p);
+    }
+}
+
+// decision point: -1 = keep local (original), otherwise the deficit server to route this tuple to.
+inline int qpsr_dest(Server& s, Relation rel, uint64_t key) {
+    if (!s.qpsr) return -1;
+    std::unordered_map<uint64_t, QpsrPlan>& plans = rel == Relation::R ? s.plan_r : s.plan_s;
+    auto it = plans.find(key);
+    if (it == plans.end()) return -1;
+    QpsrPlan& p = it->second;
+    p.credit += p.f;
+    if (p.credit < 1.0) return -1;
+    p.credit -= 1.0;
+    size_t best = 0;   // smooth weighted round-robin over deficit servers
+    for (size_t j = 0; j < p.dest.size(); ++j) {
+        p.cur[j] += p.w[j];
+        if (p.cur[j] > p.cur[best]) best = j;
+    }
+    p.cur[best] -= 1.0;
+    return p.dest[best];
+}
+
 inline Detector& detector_of(Server& s, Relation rel) {
     return rel == Relation::R ? s.det_r : s.det_s;
 }
@@ -96,16 +157,20 @@ inline bool detector_poll(Server& s, Relation rel, const Config& cfg) {
     Detector& det = detector_of(s, rel);
     std::vector<Report> reports;
     if (s.id == 0 && !det.consensus_done && read_reports(s, rel, reports)) {   // all n reports in
-        post_installs(s, rel, merge_reports(reports, cfg.theta));   
+        std::vector<KeyCount> list = merge_reports(reports, cfg.theta);
+        if (s.qpsr) post_installs(s, rel, list, merge_distribution(reports, list));   // QPSR: + distribution
+        else post_installs(s, rel, list);
         det.consensus_done = true;
     }
     std::vector<KeyCount> install;
-    if (det.installed || !read_install(s, rel, install)) return false; // already installed or install not arrived then skip
+    std::vector<std::vector<uint64_t>> dist;
+    if (det.installed || !read_install(s, rel, install, &dist)) return false; // already installed or install not arrived then skip
     std::unordered_map<uint64_t, uint64_t>& heavy = list_of(s, rel);   
     heavy.clear();
     for (const KeyCount& kc : install) {
         heavy[kc.key] = kc.count;
     }
+    if (s.qpsr) qpsr_build_plans(s, rel == Relation::R ? s.plan_r : s.plan_s, install, dist);
     det.installed = true; //installed successfully.   
     if (rel == Relation::R) {
         s.counters.l_r = install.size();
