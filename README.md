@@ -146,6 +146,4 @@ W. Rödiger, S. Idicula, A. Kemper, T. Neumann. *Flow-Join: Adaptive Skew Handli
 
 Course: **CS301 Database Management Systems**, IIT Ropar. Instructor: **Dr. Manish Kumar**.
 
-## License
 
-No license has been chosen yet. Until one is added, all rights are reserved by the authors.
