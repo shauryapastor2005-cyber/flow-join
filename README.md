@@ -120,10 +120,10 @@ echo "DONE: benchmarks/results_rho/rho_summary.txt"
 
 QPSR speedup over Flow-Join (median time ratio, 10-core machine):
 
-| Workload | n = 4 | n = 10 | Notes |
+| Workload | n = 4 | n = 10 | Remarks |
 |---|---|---|---|
 | W1, W2 (shuffled) | 0.98–1.00× | 0.99–1.02× | Essentially no tuples moved |
-| W3 (shuffled) | 0.95–1.00× | 0.95–1.03× | 2–6% slower at larger scales; cause unresolved (run order or rare false-positive moves) |
+| W3 (shuffled) | 0.95–1.00× | 0.95–1.03× | 2–6% slower at larger scales) |
 | **W4 (clustered, two-sided)** | **2.25–2.60×** | **2.79–3.48×** | Work imbalance 7.04 → 1.00 at n = 10 |
 | W5 (clustered, one-sided) | 1.00–1.04× | 0.86–0.98× | Imbalance fixed, but extra shipping (+40–47%) outweighs it |
 
